@@ -1,0 +1,208 @@
+
+delete from tst_bureau_list_upd2;
+insert into tst_bureau_list_upd2
+--create table tst_bureau_list_upd2 as
+
+/*
+Эта часть запроса полностью взята из скрипта Насти П (RT) и по своим результатам должна повторять результат рассылки 
+ASCO RSKM001. Мониторинг количества запросов БКИ
+*/
+  with t1 as
+   (select /*+ parallel(16) */
+     decode(t.connector_code, 0,  decode(t.src_sub_request_code,21, 'НБКИ Retail Score CV', 
+                                                                24, 'НБКИ Retail Score PV2', 'НБКИ'),
+                              3,  'Эквифакс',
+                              6,  'ОКБ',
+                              19, 'БРС',
+                              20,  decode(t.request_type, 5,'Equifax FPS BIO', 'Equifax FPS'),
+                              27, 'NBCH AFS',
+                              45, decode(t.src_sub_request_code, 101, 'Билайн UNI_5', 'Билайн'),
+                              29, 'СМЭВ ФМС',
+                              72, 'НБКИ ФССП',
+                              79, 'ОКБ АС') bki_name,
+     t.uid_application,
+     t.created,
+     t.bureau_status,
+     t.is_paid,
+     t.request_type,
+     t.result_code,
+     1 as all_paid_query
+    
+      from odw.odw_bch_connector_data t
+      left join odw.odw_bch_connector_data tt
+        on tt.uid_application = t.uid_application
+       and tt.application_date = t.application_date
+       and tt.sys_expdate = to_date('31.12.9999', 'dd.mm.yyyy')
+       and tt.created between to_date('&first_date', 'dd.mm.yyyy') and
+           to_date('&last_date', 'dd.mm.yyyy')
+          
+       and tt.is_paid = 1
+       and tt.request_type = 0
+       and tt.connector_code = 20
+     where 1 = 1
+          
+       and t.created between to_date('&first_date', 'dd.mm.yyyy') and
+           to_date('&last_date', 'dd.mm.yyyy')
+       and t.sys_expdate = to_date('31.12.9999', 'dd.mm.yyyy')
+       and t.result_code = 1
+       and decode(t.connector_code,20, decode(t.REQUEST_TYPE, 5,decode(tt.rowid,null,0,1), decode(t.bureau_status, 0,1,3,1,4,1,0)),
+                                  72, decode(t.BUREAU_STATUS, 0,1,1,1,3,1,4,1,0),
+                                      decode(t.BUREAU_STATUS, 0,1,3,1,4,1,0)) = 1
+    
+    )
+  select * from t1;
+commit;
+
+delete from userbox_risk_mis.dev_bureau_list_app2 l
+ where l.created >=
+       (select min(u.created) from userbox_risk_mis.tst_bureau_list_upd2 u);
+
+commit;
+
+insert into userbox_risk_mis.dev_bureau_list_app2
+  select /*+ parallel(16) */
+   d.bki_name,
+   aps.superid as application_num,
+   d.created,
+   trunc(d.created) as data_request,
+   d.bureau_status,
+   d.is_paid,
+   d.request_type,
+   d.result_code,
+   1 as all_paid_query,
+   0 as another_paid_request_brs,
+   0 as another_paid_request_fps,
+   case when bureau_status is null then 1 else 0 end trade_error,
+   case when bureau_status = 0 then 1 else 0 end has_data,
+   case when bureau_status = 1 then 1 else 0 end only_query,
+   case when bureau_status = 2 then 1 else 0 end bureau_error,
+   case when bureau_status = 3 then  1 else 0 end has_credit_history,
+   case when bureau_status = 4 then 1 else 0 end no_data,
+   case when bureau_status = 5 then 1 else 0 end cashed_request,
+   case when is_paid = 1 then 1 else 0 end is_paid_count,
+  
+   to_number(to_char(trunc(d.created), 'iw')) as week_num2,
+   to_number(to_char(trunc(d.created), 'yyyy')) as year_num,
+   to_char(trunc(d.created), 'iw') || to_char(trunc(created), 'yyyy') as date_num_week2,
+   to_char(trunc(d.created), 'mm') || to_char(trunc(created), 'yyyy') as date_num_month,
+   
+   ap.conf_prod_code,
+   ap.region_merchant_name,
+   ap.portfolio_key,
+   ap.portfolio_num,
+   ap.segment_num,
+   ap.sub_segment_num,
+   ap.pos_id               as appposid,
+   ap.regpos_id            as appregposid,
+   m1.abs_id               as abs_id_input,
+   m2.abs_id               as abs_id_issue,
+   
+   aps.sub_channel,
+   aps.upper_channel,
+   aps.channel,
+   
+   case
+     when nvl(ap.mfo_ind, 3) = 2 then 'MFO'
+     when ap.dwh_src_key = 7 then 'NCC'
+     when ap.dwh_src_key = 3 then 'SCC'
+     else 'not defined'
+   end fl_source,
+   d.uid_application as application_code
+  
+    from tst_bureau_list_upd2 d
+    left join app.dim_application ap
+      on d.uid_application = ap.application_code
+    left join risk_appl.application_a aps
+      on ap.application_num = aps.superid
+    left join dimdm.v_dim_merchant_binding m1
+      on ap.pos_id = m1.id
+     and m1.exp_dt > trunc(sysdate)
+     and trunc(m1.end_dt) > trunc(sysdate)
+    left join dimdm.v_dim_merchant_binding m2
+      on ap.regpos_id = m2.id
+     and m2.exp_dt > trunc(sysdate)
+     and trunc(m2.end_dt) > trunc(sysdate)
+  
+  ;
+  
+commit;
+
+-- manual check 1
+--select /*+ PARALLEL(16) */ trunc(t.created), count(*)  from dev_bureau_list_app2 t group by trunc(t.created)  ;
+
+/*Add next week*/
+delete from dev_bureau_report_;
+insert into dev_bureau_report_
+  select /*+ PARALLEL(16) */
+   case
+     when a.bki_name = 'Билайн' then 'БИЛАЙН'
+     when a.bki_name = 'Equifax FPS BIO' then 'Эквифакс BIO'
+     when a.bki_name = 'NBCH AFS' then 'AFS'
+     when a.bki_name = 'Equifax FPS' then 'FPS'
+     when a.bki_name = 'НБКИ Retail Score CV' then 'НБКИ Retail Score' 
+     else a.bki_name
+   end bki_name,
+   
+   a.conf_prod_code,
+   /*region_merchant_name, */
+   a.upper_channel,
+   a.channel,
+   a.sub_channel,
+   a.portfolio_key,
+   a.portfolio_num,
+   a.segment_num,
+   a.sub_segment_num,
+   a.week_num2       as week_num,
+   a.year_num        as year_num,
+   a.date_num_week2  as date_num_week,
+   a.date_num_month,
+   
+   count(a.application_num) as all_query, /*--всего запросов*/
+   sum(a.only_query) as no_history, /*--нет данных (статус 1)*/
+   sum(another_paid_request_brs) as another_paid_request_brs, /*-- в разработке.другие платные запросы (есть только в брс)*/
+   sum(another_paid_request_fps) as another_paid_request_fps, /*-- в разработке.другие платные запросы (есть только в fps antifraud)*/
+   sum(bureau_error) as bureau_error, /* --ошибки бюро (статус 2)*/
+   sum(has_credit_history) as only_query, /*--только запросы (статус 3)*/
+   sum(a.no_data) as bureau_hit, /*--есть кредитная история (статус 4)*/
+   sum(cashed_request) as cashed_request, /*--кешированные запросы (статус 5)*/
+   sum(all_paid_query) as all_paid_query /*--всего платных запросов*/
+    from dev_bureau_list_app2 a
+   where a.bki_name != 'СМЭВ ФМС'
+  /*
+   and to_char(trunc(a.created), 'iw')||to_char(trunc(a.created), 'yyyy') <
+                         (
+                                select (to_char(b.max_dt, 'iw')||to_char(b.max_dt, 'yyyy')) as date_num_week2
+                                 from  (select max((trunc(d2.created))) as max_dt from tst_bureau_list_upd2 d2) b
+                         )
+  */
+   group by a.bki_name,
+            a.conf_prod_code,
+            /*region_merchant_name, */
+            a.upper_channel,
+            a.channel,
+            a.sub_channel,
+            a.portfolio_key,
+            a.portfolio_num,
+            a.segment_num,
+            a.sub_segment_num,
+            a.week_num2,
+            a.year_num,
+            a.date_num_week2,
+            a.date_num_month;
+commit;
+
+/* Manual check2 
+select t.bki_name, year_num, week_num, date_num_month, sum(all_paid_query)
+from  userbox_risk_mis.dev_bureau_report_ t
+where year_num = '2022'  and week_num in ('40', '41','42', '43', '44', '45','46', '47', '48', '49', '50', '51', '52')
+group by t.bki_name,year_num, t.date_num_month,   week_num;
+
+*/
+
+/* Manual check3. Please Use ASCO RSKM001 for correctness confirmation
+select t.bki_name, year_num, week_num, date_num_month, sum(all_paid_query)
+from  userbox_risk_mis.dev_bureau_report_ t
+where year_num = '2023'  --and week_num in ('40', '41','42', '43', '44', '45','46', '47', '48', '49', '50', '51', '52')
+group by t.bki_name,year_num, t.date_num_month,   week_num;
+
+*/
